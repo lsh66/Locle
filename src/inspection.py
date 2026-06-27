@@ -9,6 +9,7 @@ from models.nn import LinearRegression
 from openail.utils import load_mapping
 import numpy as np
 from helper.train_utils import seed_everything
+# 生成论文里要的图
 
 plt.figure(figsize=(12, 6))
 

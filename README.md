@@ -29,5 +29,19 @@ dgl==1.1.1
 bash train_bash/best_cache.sh
 ```
 
-# Acknowledgements
-This code repo is based on [LLMGNN](https://github.com/CurryTang/LLMGNN). Thanks for their great work!
+
+
+为什么这么多 .pt 文件：
+项目在每个计算步骤后都调用 torch.save() 缓存中间结果，避免重复计算。具体分布：
+
+目录	          存什么	                 例子
+data/*.pt	数据集主文件	cora_fixed_sbert.pt
+data/aax/	主动学习预计算	aax_2708.pt、density_aax_2708_70.pt
+data/active/	LLM 伪标签结果	cora^cache^few_shot_all.pt
+data/cache/	API 请求 / 响应缓存	.json 文件
+data/annotations/	LLM 标注结果	.json 文件
+data/partitions/	图分区结果	给 gpart_query 用
+data/subspace_selection/	子空间选择缓存	729 个文件
+
+本质是这个项目的实验流程很长（数据预处理 → LLM标注 → 主动学习 → 训练），
+每个环节的中间结果都落盘成 .pt，方便断点续跑和复用。

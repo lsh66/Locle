@@ -40,6 +40,9 @@ class Data:
             return self.M
         else:
             raise AttributeError(f"'Data' object has no attribute '{name}'")
+
+        # 这个函数计算的是基于随机游走的扩散矩阵
+        # M，用于捕获图中节点之间的高阶邻域关系
 def get_M(adj, t=2):
     """
     calculate the matrix M by the equation:

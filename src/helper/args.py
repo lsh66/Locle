@@ -47,7 +47,7 @@ def get_command_line_args():
      parser.add_argument("--formats", nargs='+', type=str, default=[])
      parser.add_argument("--ensemble_string", type=str, default="")
      parser.add_argument("--pl_noise", type=float, default=0)
-     parser.add_argument("--yaml_path",type=str,default="config.yaml")
+     parser.add_argument("--yaml_path", type=str, default=r"C:\Users\23739\Desktop\study\work2\Locle\config.yaml")
      parser.add_argument("--no_val", type=int, default=0)
      parser.add_argument("--label_smoothing", type=float, default=0)
      parser.add_argument("--budget", type=int, default=20)

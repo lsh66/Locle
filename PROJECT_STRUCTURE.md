@@ -134,6 +134,3 @@ pip install -r requirements.txt
 
 ---
 
-## 致谢
-
-本项目代码基于 [LLMGNN](https://github.com/CurryTang/LLMGNN) 开发。
