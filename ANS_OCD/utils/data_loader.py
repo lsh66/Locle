@@ -29,9 +29,19 @@ except ImportError:
 from ANS_OCD.config import DEVICE, SBERT_MODEL, PROJECT_ROOT
 
 
-def load_cora_pt(pt_path: Union[str, Path] = None) -> Data:
+# Mapping from dataset name to its pre-built .pt filename in data/.
+PT_DATASET_FILES = {
+    "cora": "cora_fixed_sbert.pt",
+    "citeseer": "citeseer2_fixed_sbert.pt",
+    "pubmed": "pubmed_fixed_sbert.pt",
+}
+
+
+def load_pt_dataset(name: str = "cora", pt_path: Union[str, Path] = None) -> Data:
     """
-    Load the Cora dataset from a PyTorch Geometric .pt file.
+    Load a dataset from a PyTorch Geometric .pt file.
+
+    Supported names (see PT_DATASET_FILES): cora, citeseer, pubmed.
 
     The .pt file is expected to contain a torch_geometric.data.Data object with:
     - edge_index: torch.LongTensor [2, E]
@@ -42,8 +52,10 @@ def load_cora_pt(pt_path: Union[str, Path] = None) -> Data:
 
     Parameters
     ----------
+    name : str
+        Dataset name key in PT_DATASET_FILES. Ignored if pt_path is given.
     pt_path : str or Path, optional
-        Path to the cora .pt file. Defaults to PROJECT_ROOT / "data" / "cora_fixed_sbert.pt".
+        Explicit path to a .pt file. Overrides `name`.
 
     Returns
     -------
@@ -51,10 +63,14 @@ def load_cora_pt(pt_path: Union[str, Path] = None) -> Data:
         PyG Data object compatible with the ANS-OCD pipeline.
     """
     if pt_path is None:
-        pt_path = PROJECT_ROOT / "data" / "cora_fixed_sbert.pt"
+        if name not in PT_DATASET_FILES:
+            raise ValueError(
+                f"Unknown dataset '{name}'. Available: {list(PT_DATASET_FILES)}"
+            )
+        pt_path = PROJECT_ROOT / "data" / PT_DATASET_FILES[name]
     pt_path = Path(pt_path)
     if not pt_path.exists():
-        raise FileNotFoundError(f"Cora .pt file not found: {pt_path}")
+        raise FileNotFoundError(f"Dataset .pt file not found: {pt_path}")
 
     data = torch.load(pt_path, map_location="cpu")
     # Ensure required fields exist.

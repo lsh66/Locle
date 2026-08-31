@@ -277,7 +277,7 @@ A：在 Python 3.10 环境中安装 `requirements.txt` 指定版本即可避免�
 
 ```gitignore
 config.yaml
-```
+``
 
 ---
 

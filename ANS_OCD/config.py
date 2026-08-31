@@ -33,6 +33,8 @@ MULTILABEL_CONFIG = {
     "overlap_threshold": 0.4,   # Threshold for overlapping community membership
     "entropy_sigma": 1e-9,     # Smoothing term for label entropy
     "pruning_threshold": 0.05, # GNN pruning threshold for expansion candidates
+    "max_negative_gain": -0.05, # Allow slightly negative cohesion gain during expansion (sparse graphs)
+    "expansion_budget_ratio": 0.35, # Per-community budget = ceil(N/K * ratio); full coverage now comes from GNN argmax, not brute-force expansion
     "ctl_conflict_high": 0.9,   # High GNN probability but low heuristic score
     "ctl_conflict_low": 0.05,   # Low GNN probability but high heuristic score
 }

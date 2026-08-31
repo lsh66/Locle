@@ -51,8 +51,14 @@ def cal_AC(c: List[int], content: np.ndarray) -> float:
     norms = np.sqrt(X_c_sp.power(2).sum(axis=1)).A1
     X_c_sp = X_c_sp.multiply(1.0 / (norms[:, None] + 1e-8))
     S = X_c_sp @ X_c_sp.T
+    # S.sum() includes the diagonal (len(c) self-similarities of 1). Subtracting it
+    # leaves the sum over ORDERED pairs (i!=j), i.e. 2 * sum_{i<j} cos.
+    # AC is the mean over UNORDERED pairs: sum_{i<j} cos / (|c|(|c|-1)/2).
+    # NOTE: the previous formula multiplied by an extra factor of 2, which
+    # double-counted and then got clipped to 1.0 -- making AC a constant 1.0 with
+    # no discriminative power for guiding expansion.
     total_sum = S.sum() - len(c)
-    ac = 2 * total_sum / (len(c) * (len(c) - 1))
+    ac = total_sum / (len(c) * (len(c) - 1))
     return float(np.clip(ac, -1.0, 1.0))
 
 
@@ -171,9 +177,102 @@ class CommunityExpander:
         self.G = nx.from_numpy_array(self.adj)
         self.communities: List[Set[int]] = [set() for _ in range(self.num_communities)]
 
+        # --- Incremental bookkeeping for fast Delta C_o evaluation ---
+        # Without these caches, each Delta C_o call rebuilt the whole community's
+        # structural counts and its |c| x |c| attribute-similarity matrix, giving
+        # O(budget * candidates * |c|^2 * D) total cost -- which made expansion
+        # hang for hours on graphs like citeseer (3186 nodes).
+        # With unit-norm features, AC can be maintained from the running feature
+        # SUM alone:  sum_{i<j} cos(x_i,x_j) = (|sum x|^2 - |c|) / 2.
+        norms = np.linalg.norm(self.attr, axis=1, keepdims=True)
+        self.attr_norm = (self.attr / (norms + 1e-12)).astype(np.float32)
+        # Per community: {"size", "ein", "eout", "sum_feat"}
+        self._stats: List[Dict] = [self._empty_stats() for _ in range(self.num_communities)]
+        self._boundary: List[Set[int]] = [set() for _ in range(self.num_communities)]
+
+    def _empty_stats(self) -> Dict:
+        """Return a zeroed incremental-stats dict for one community."""
+        return {
+            "size": 0,
+            "ein": 0,
+            "eout": 0,
+            "sum_feat": np.zeros(self.attr.shape[1], dtype=np.float64),
+        }
+
+    def _build_stats(self, cid: int) -> Dict:
+        """Compute incremental stats for community cid from scratch (O(|c|*deg))."""
+        members = list(self.communities[cid])
+        st = self._empty_stats()
+        if members:
+            _, ein, eout = prepare_SC_incremental_data(members, self.G)
+            st["size"] = len(members)
+            st["ein"] = int(ein)
+            st["eout"] = int(eout)
+            st["sum_feat"] = self.attr_norm[members].sum(axis=0).astype(np.float64)
+        return st
+
+    def _build_boundary(self, cid: int) -> Set[int]:
+        """Compute the boundary (neighbors outside the community) from scratch."""
+        community = self.communities[cid]
+        b = set()
+        for node in community:
+            for nb in self.G.neighbors(node):
+                if nb not in community:
+                    b.add(nb)
+        return b
+
+    def _rebuild_caches(self):
+        """Rebuild stats and boundary caches for all communities."""
+        for cid in range(self.num_communities):
+            self._stats[cid] = self._build_stats(cid)
+            self._boundary[cid] = self._build_boundary(cid)
+
+    def _ac_from_stats(self, st: Dict) -> float:
+        """Attribute cohesion from cached stats: AC = (|sum x|^2 - |c|)/(|c|(|c|-1))."""
+        size = st["size"]
+        if size <= 1:
+            return 1.0
+        s = st["sum_feat"]
+        pair_sum = (float(s @ s) - size) / 2.0
+        return float(np.clip(2.0 * pair_sum / (size * (size - 1)), -1.0, 1.0))
+
+    def _delta_Co_fast(self, cid: int, node: int, st: Dict) -> float:
+        """Delta C_o in O(D + deg(node)) using cached stats (vs O(|c|^2 * D) before)."""
+        c_set = self.communities[cid]
+        neighbors = set(self.G.neighbors(node))
+        added_internal = len(neighbors & c_set)
+        added_external = len(neighbors - c_set)
+        size_new = st["size"] + 1
+        ein_new = st["ein"] + added_internal
+        eout_new = st["eout"] - added_internal + added_external
+        delta_sc = (cal_SC_incremental(size_new, ein_new, eout_new)
+                    - cal_SC_incremental(st["size"], st["ein"], st["eout"]))
+        ac_before = self._ac_from_stats(st)
+        sum_after = st["sum_feat"] + self.attr_norm[node]
+        ac_after = self._ac_from_stats({"size": size_new, "sum_feat": sum_after})
+        return delta_sc + (ac_after - ac_before)
+
+    def _commit_node(self, cid: int, node: int):
+        """Add node to community cid and update all incremental caches."""
+        self.communities[cid].add(node)
+        st = self._stats[cid]
+        neighbors = set(self.G.neighbors(node))
+        members = self.communities[cid]
+        added_internal = len(neighbors & (members - {node}))
+        added_external = len(neighbors - members)
+        st["ein"] += added_internal
+        st["eout"] += added_external - added_internal
+        st["size"] += 1
+        st["sum_feat"] = st["sum_feat"] + self.attr_norm[node]
+        # Boundary update: node is no longer a candidate; its outside neighbors are.
+        self._boundary[cid].discard(node)
+        for nb in neighbors:
+            if nb not in members:
+                self._boundary[cid].add(nb)
+
     def initialize(self, seeds: Dict[int, List[int]]):
         """
-        Initialize each community with seed nodes.
+        Initialize each community with seed nodes and rebuild incremental caches.
 
         Parameters
         ----------
@@ -183,16 +282,11 @@ class CommunityExpander:
         for cid, nodes in seeds.items():
             if 0 <= cid < self.num_communities:
                 self.communities[cid] = set(int(n) for n in nodes)
+        self._rebuild_caches()
 
     def _boundary_candidates(self, cid: int) -> Set[int]:
-        """Return the set of neighbor nodes that are not yet in community cid."""
-        community = self.communities[cid]
-        candidates = set()
-        for node in community:
-            for neighbor in self.G.neighbors(node):
-                if neighbor not in community:
-                    candidates.add(neighbor)
-        return candidates
+        """Return cached boundary (neighbors not yet in community cid)."""
+        return self._boundary[cid]
 
     def _delta_Co(self, cid: int, node: int) -> float:
         """
@@ -207,7 +301,9 @@ class CommunityExpander:
         # Equal weighting of structural and attribute gains. Can be tuned.
         return delta_sc + delta_ac
 
-    def expand_community(self, cid: int, budget: int) -> List[int]:
+    def expand_community(self, cid: int, budget: int, prune: bool = True,
+                          max_negative_gain: float = 0.0,
+                          max_candidates: int = 200) -> List[int]:
         """
         Greedily expand a single community within the given budget.
 
@@ -217,6 +313,20 @@ class CommunityExpander:
             Community id.
         budget : int
             Maximum number of new nodes to add.
+        prune : bool, default True
+            If True, drop candidate nodes whose GNN membership probability is
+            below ``self.pruning_threshold`` before scoring. If False (used in
+            early self-training rounds when the GNN is still weak), all boundary
+            neighbors are kept so the community can grow via the heuristic
+            cohesion objective alone, preventing the expansion from stalling.
+        max_negative_gain : float, default 0.0
+            Allow a candidate with slightly negative cohesion improvement to be
+            accepted (top-1 among candidates), as long as its score is above
+            this floor. On sparse graphs (low avg degree) most boundary nodes
+            yield Delta C_o <= 0, so the old "strictly positive" rule stopped
+            expansion after only the seed nodes. Permitting a small negative
+            gain lets the community spread across structural boundaries instead
+            of stalling.
 
         Returns
         -------
@@ -224,31 +334,45 @@ class CommunityExpander:
             Nodes added in this expansion round.
         """
         added_nodes = []
+        st = self._stats[cid]
         for _ in range(budget):
             candidates = self._boundary_candidates(cid)
             if not candidates:
                 break
-            # GNN-guided pruning: keep only candidates with high membership probability.
-            candidates = [n for n in candidates if self.probs[n, cid] >= self.pruning_threshold]
-            if not candidates:
-                break
+            # GNN-guided pruning: keep only candidates with high membership
+            # probability. Skipped when prune=False (early rounds).
+            if prune:
+                candidates = [n for n in candidates if self.probs[n, cid] >= self.pruning_threshold]
+                if not candidates:
+                    break
+
+            # Cap the number of scored candidates so a huge boundary cannot make a
+            # single expansion step quadratic in the graph size.
+            if max_candidates and len(candidates) > max_candidates:
+                candidates = sorted(
+                    candidates, key=lambda n: float(self.probs[n, cid]), reverse=True
+                )[:max_candidates]
 
             best_node, best_score = None, -np.inf
             for n in candidates:
-                score = self._delta_Co(cid, n)
+                score = self._delta_Co_fast(cid, n, st)
                 if score > best_score:
                     best_score = score
                     best_node = n
 
-            # Only accept strictly positive cohesion improvements.
-            if best_node is None or best_score <= 0:
+            # Accept the best candidate unless its cohesion improvement is worse
+            # than the allowed negative floor. This lets communities grow even
+            # when the top candidate has a slightly negative Delta C_o.
+            if best_node is None or best_score <= max_negative_gain:
                 break
-            self.communities[cid].add(best_node)
+            self._commit_node(cid, best_node)
             added_nodes.append(best_node)
         return added_nodes
 
     def expand_all(self, budgets: Optional[Dict[int, int]] = None,
-                   default_budget: int = 50) -> Dict[int, List[int]]:
+                   default_budget: int = 50, prune: bool = True,
+                   max_negative_gain: float = 0.0,
+                   max_candidates: int = 200) -> Dict[int, List[int]]:
         """
         Expand all communities. Each community can have its own budget.
 
@@ -258,6 +382,12 @@ class CommunityExpander:
             Mapping from community id to expansion budget. Defaults to default_budget.
         default_budget : int
             Default budget per community if budgets is not provided.
+        prune : bool, default True
+            Whether to apply GNN probability pruning (see ``expand_community``).
+        max_negative_gain : float, default 0.0
+            Negative cohesion floor passed to ``expand_community``.
+        max_candidates : int, default 200
+            Max candidates scored per expansion step (performance guard).
 
         Returns
         -------
@@ -269,7 +399,9 @@ class CommunityExpander:
             if not self.communities[cid]:
                 continue
             budget = budgets.get(cid, default_budget) if budgets else default_budget
-            added = self.expand_community(cid, budget)
+            added = self.expand_community(cid, budget, prune=prune,
+                                          max_negative_gain=max_negative_gain,
+                                          max_candidates=max_candidates)
             added_by_community[cid] = added
         return added_by_community
 

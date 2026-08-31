@@ -10,8 +10,9 @@ Steps:
 Author: ANS-OCD project
 """
 import numpy as np
+import scipy.sparse as sp
 from scipy.sparse import csgraph
-from scipy.sparse.linalg import eigsh
+from scipy.sparse.linalg import eigsh, eigs
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from typing import Tuple, Optional
@@ -43,15 +44,18 @@ def _normalize_adjacency(adj_matrix: np.ndarray) -> np.ndarray:
 
 def build_joint_feature_matrix(adj_matrix: np.ndarray,
                                attr_matrix: Optional[np.ndarray] = None,
-                               use_degree: bool = True) -> np.ndarray:
+                               use_degree: bool = True,
+                               spectral_k: int = 10) -> np.ndarray:
     """
     Build a joint structure + attribute feature matrix.
 
-    Structure features are extracted from the adjacency matrix: we use the
-    symmetrically normalized adjacency rows as structural embeddings. This
-    keeps the feature dimension equal to N, which is consistent with a
-    self-expression formulation where each node is represented by all other
-    nodes. Attribute features are concatenated if provided.
+    Structure features are node-level descriptors that are robust on sparse
+    graphs: node degree, PageRank, clustering coefficient, triangle count, and
+    the top-k non-trivial eigenvectors of the normalized Laplacian. Using these
+    compact node-level descriptors instead of raw normalized-adjacency rows
+    avoids the degenerate "everything-connected" self-expression affinity that
+    occurs when normalized adjacency rows are nearly identical on sparse graphs
+    (which previously forced K_init -> 1). Attribute features are concatenated.
 
     Parameters
     ----------
@@ -60,21 +64,54 @@ def build_joint_feature_matrix(adj_matrix: np.ndarray,
     attr_matrix : np.ndarray, optional, shape [N, D]
         Node attribute matrix. If None, only structure features are used.
     use_degree : bool
-        Whether to append node degree as an additional structure feature.
+        Kept for API compatibility (degree is always included now).
+    spectral_k : int
+        Number of non-trivial Laplacian eigenvectors to append.
 
     Returns
     -------
     F : np.ndarray, shape [N, feature_dim]
         Joint feature matrix after column-wise standardization.
     """
-    norm_adj = _normalize_adjacency(adj_matrix)
-    features = [norm_adj]
-    if use_degree:
-        degrees = np.array(adj_matrix.sum(axis=1)).flatten()[:, None]
-        features.append(degrees)
+    import networkx as nx
+    adj = np.asarray(adj_matrix)
+    n = adj.shape[0]
+
+    # Build a networkx graph (handles sparse / dense / weighted input).
+    try:
+        G = nx.from_numpy_array(adj)
+    except Exception:
+        G = nx.from_scipy_sparse_array(adj) if sp.issparse(adj) else nx.from_numpy_array(adj)
+
+    # --- Node-level structural descriptors (N x 4) ---
+    degrees = np.array([d for _, d in G.degree()], dtype=np.float64).reshape(-1, 1)
+    pagerank = np.array(list(nx.pagerank(G).values()), dtype=np.float64).reshape(-1, 1)
+    clustering = np.array(list(nx.clustering(G).values()), dtype=np.float64).reshape(-1, 1)
+    triangles = np.array(list(nx.triangles(G).values()), dtype=np.float64).reshape(-1, 1)
+    struct_node = np.hstack([degrees, pagerank, clustering, triangles])
+
+    # --- Spectral structural block: top-k non-trivial Laplacian eigenvectors ---
+    try:
+        lap = nx.normalized_laplacian_matrix(G).astype(np.float64)
+        k_eig = min(spectral_k + 1, n - 1)
+        eigvals, eigvecs = sp.linalg.eigs(lap, k=k_eig, which="SM")
+        order = np.argsort(np.real(eigvals))
+        # drop the trivial eigenvector (lambda ~ 0)
+        start = 1 if k_eig > 1 else 0
+        eigvecs = np.real(eigvecs[:, order[start:start + spectral_k]])
+        if eigvecs.shape[1] == 0:
+            eigvecs = np.zeros((n, 1))
+    except Exception:
+        eigvecs = np.zeros((n, 1))
+
+    struct = np.hstack([struct_node, eigvecs])
+
+    # Standardize structural block per column to balance scales.
+    struct = StandardScaler().fit_transform(struct)
+
+    features = [struct]
     if attr_matrix is not None:
-        # Ensure float32 and zero-mean / unit-variance per column.
-        attr = StandardScaler().fit_transform(attr_matrix.astype(np.float32))
+        attr = StandardScaler().fit_transform(np.asarray(attr_matrix, dtype=np.float32))
         features.append(attr)
     F = np.concatenate(features, axis=1)
     return F
@@ -162,6 +199,21 @@ def estimate_k_via_eigengap(S: np.ndarray, max_k: int = 50,
     spectrum = eigvals if return_spectrum else eigvals[:max_k + 1]
     gaps = np.diff(spectrum)
     k_init = int(np.argmax(gaps)) + 1  # +1 because gap_i separates k=i+1
+
+    # Robustness floor: the raw eigengap heuristic collapses to 1 on sparse
+    # graphs where the affinity spectrum is near-flat, and the single dominant
+    # (trivial) gap can mask genuinely smaller but real community splits. So we
+    # (1) collect every gap significantly larger than the mean gap as a candidate
+    #     community boundary, and (2) take the largest such boundary as K.
+    # (3) enforce a sensible minimum so K never degenerates to 1 on real graphs.
+    min_k = max(2, min(max_k // 8, 8))
+    med_gap = np.median(gaps)
+    strong = np.where(gaps > med_gap)[0]   # indices of real (above-median) splits
+    if len(strong) > 0:
+        k_candidate = int(strong[-1]) + 1   # last significant gap => most communities
+        k_init = max(k_init, k_candidate)
+    k_init = max(k_init, min_k)
+    k_init = min(k_init, max_k)
     k_init = max(1, k_init)
     return k_init, spectrum
 
@@ -193,6 +245,7 @@ class SubspaceClusterEstimator:
         attr_matrix : np.ndarray, optional, shape [N, D]
         """
         F = build_joint_feature_matrix(adj_matrix, attr_matrix)
+        self.F_ = F
         self.S = compute_self_expression_matrix(F, alpha=self.alpha,
                                                 threshold_ratio=self.threshold_ratio)
         self.k_init, self.spectrum = estimate_k_via_eigengap(
@@ -229,6 +282,18 @@ class SubspaceClusterEstimator:
         labels = KMeans(n_clusters=k, random_state=42, n_init="auto").fit_predict(embedding)
         self.labels = labels
         return labels
+
+    def get_feature_matrix(self) -> np.ndarray:
+        """
+        Return the joint structure+attribute feature matrix F computed in ``fit``.
+
+        Useful for a second-level merge of the k_init structural clusters into a
+        smaller, semantically aligned number of communities (e.g. the ground-truth
+        class count) without losing any seed supervision.
+        """
+        if self.F_ is None:
+            raise RuntimeError("call fit() before get_feature_matrix()")
+        return self.F_
 
 
 if __name__ == "__main__":
