@@ -8,7 +8,7 @@ arbitration.
 Author: ANS-OCD project
 """
 import numpy as np
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 
 from ANS_OCD.config import MULTILABEL_CONFIG
 from ANS_OCD.module3_expansion.community_expander import CommunityExpander
@@ -17,14 +17,16 @@ from ANS_OCD.module3_expansion.community_expander import CommunityExpander
 def detect_conflicts(expander: CommunityExpander,
                      high_prob: float = MULTILABEL_CONFIG["ctl_conflict_high"],
                      low_prob: float = MULTILABEL_CONFIG["ctl_conflict_low"],
-                     delta_high: float = 0.5) -> List[Tuple[int, int, str]]:
+                     delta_high: float = MULTILABEL_CONFIG.get("ctl_delta_high", 0.2),
+                     extra_candidates: Optional[Set[int]] = None
+                     ) -> List[Tuple[int, int, str, float]]:
     """
     Scan boundary nodes of all communities and detect severe rule-vs-GNN conflicts.
 
     Two conflict types are captured:
     1. "rule_favor_gnn_against": heuristic strongly favors adding the node (ΔCo is
        large and positive) but the GNN probability for this community is very low.
-    2. "gnn_favor_rule_against": GNN strongly favors membership (probability > 0.9)
+    2. "gnn_favor_rule_against": GNN strongly favors membership (probability > high_prob)
        but the heuristic ΔCo is negative (the node would hurt community cohesion).
 
     Parameters
@@ -36,40 +38,51 @@ def detect_conflicts(expander: CommunityExpander,
     low_prob : float
         Low-probability threshold for rule-favor conflict.
     delta_high : float
-        ΔCo threshold for "strong heuristic favor".
+        ΔCo threshold for "strong heuristic favor". NOTE: the original 0.5 was too
+        strict -- ΔCo rarely exceeds it on real sparse graphs, so the detector
+        returned 0 conflicts and CTL never fired. Now configurable and lower.
+    extra_candidates : set of int, optional
+        Additional nodes to scan beyond the boundary, e.g. the high-label-entropy
+        set from Stage 3. Uncertain nodes are exactly the ones worth arbitrating.
 
     Returns
     -------
-    conflicts : List[Tuple[int, int, str]]
-        List of (node_id, community_id, conflict_type).
+    conflicts : List[Tuple[int, int, str, float]]
+        List of (node_id, community_id, conflict_type, delta_co). The delta_co is
+        returned so the caller can pass the REAL heuristic score into the LLM
+        prompt (it was previously hardcoded to 0.0).
     """
     conflicts = []
     for cid in range(expander.num_communities):
         if not expander.communities[cid]:
             continue
-        candidates = expander._boundary_candidates(cid)
+        candidates = set(expander._boundary_candidates(cid))
+        if extra_candidates:
+            # Stage 3 high-entropy nodes join the "to be decided" queue.
+            candidates |= set(extra_candidates)
         for node in candidates:
-            delta_co = expander._delta_Co(cid, node)
+            delta_co = float(expander._delta_Co_fast(cid, node, expander._stats[cid]))
             prob = float(expander.probs[node, cid])
             if delta_co > delta_high and prob < low_prob:
-                conflicts.append((int(node), cid, "rule_favor_gnn_against"))
+                conflicts.append((int(node), cid, "rule_favor_gnn_against", delta_co))
             elif delta_co < 0 and prob > high_prob:
-                conflicts.append((int(node), cid, "gnn_favor_rule_against"))
+                conflicts.append((int(node), cid, "gnn_favor_rule_against", delta_co))
     return conflicts
 
 
-def deduplicate_conflicts(conflicts: List[Tuple[int, int, str]]) -> List[Tuple[int, int, str]]:
+def deduplicate_conflicts(conflicts: List[Tuple[int, int, str, float]]
+                          ) -> List[Tuple[int, int, str, float]]:
     """
     Keep only one conflict record per (node, community) pair. If both conflict
     types exist for the same pair, the one detected first is retained.
     """
     seen = set()
     unique = []
-    for node, cid, ctype in conflicts:
+    for node, cid, ctype, delta_co in conflicts:
         key = (node, cid)
         if key not in seen:
             seen.add(key)
-            unique.append((node, cid, ctype))
+            unique.append((node, cid, ctype, delta_co))
     return unique
 
 
@@ -103,8 +116,9 @@ if __name__ == "__main__":
     expander = CommunityExpander(adj, attr, probs, pruning_threshold=0.05)
     expander.initialize({0: [0, 1], 1: [10, 11]})
 
-    conflicts = detect_conflicts(expander, high_prob=0.9, low_prob=0.05, delta_high=0.5)
+    conflicts = detect_conflicts(expander, high_prob=0.9, low_prob=0.05, delta_high=0.5,
+                                 extra_candidates={9})
     conflicts = deduplicate_conflicts(conflicts)
     print(f"Detected {len(conflicts)} conflicts:")
-    for node, cid, ctype in conflicts:
-        print(f"  Node {node} vs Community {cid}: {ctype}")
+    for node, cid, ctype, delta_co in conflicts:
+        print(f"  Node {node} vs Community {cid}: {ctype} (delta_co={delta_co:.4f})")

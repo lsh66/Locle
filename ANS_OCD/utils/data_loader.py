@@ -34,6 +34,9 @@ PT_DATASET_FILES = {
     "cora": "cora_fixed_sbert.pt",
     "citeseer": "citeseer2_fixed_sbert.pt",
     "pubmed": "pubmed_fixed_sbert.pt",
+    "wikics": "wikics_fixed_sbert.pt",
+    "dblp": "dblp_fixed_sbert.pt",
+    "amazon": "amazon_fixed_attr.pt",
 }
 
 

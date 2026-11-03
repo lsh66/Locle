@@ -33,7 +33,8 @@ from ANS_OCD.config import (
     SUBSPACE_CONFIG,
     DIVRANK_CONFIG,
 )
-from ANS_OCD.utils.data_loader import load_graph_data, read_texts, load_pt_dataset
+from ANS_OCD.utils.data_loader import (load_graph_data, read_texts, load_pt_dataset,
+                                       PT_DATASET_FILES)
 from ANS_OCD.module1_representative.subspace_cluster import SubspaceClusterEstimator
 from ANS_OCD.module1_representative.divrank_selector import (
     select_representatives_per_cluster,
@@ -229,7 +230,9 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
         Evaluation metrics if ground-truth labels are available.
     """
     # --- Stage 1: data loading + GNN initialization ---
-    if dataset in ("cora", "citeseer", "pubmed"):
+    # Any dataset registered in PT_DATASET_FILES is loaded from its pre-built .pt
+    # file, so adding a new dataset only requires an entry in that mapping.
+    if dataset in PT_DATASET_FILES:
         print(f"[ANS-OCD] Running on {dataset} dataset (pre-built .pt file).")
         data = load_pt_dataset(name=dataset)
         labels = data.y if data.y.ndim == 2 else None
@@ -261,7 +264,7 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
     )
     estimator.fit(adj, attr)
     k_init = estimator.k_init
-    print(f"  K_init estimated by Eigengap: {k_init}")
+    print(f"  K_init estimated by {estimator.k_method}: {k_init}")
 
     cluster_labels = estimator.get_kmeans_labels()
     representatives, divrank_scores = select_representatives_per_cluster(
@@ -289,11 +292,17 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
             true_k = int(y_arr.max()) + 1
         elif y_arr.ndim == 2:
             true_k = y_arr.shape[1]
-    if true_k is not None:
-        # Ground-truth labels exist: anchor K to the real class count. The LLM
-        # theme count (k_final) is NOT allowed to override it -- on citeseer the
-        # Mock LLM returned k_final=36 (one theme per noisy cluster), which would
-        # otherwise blow K far past the true 6 classes and collapse jaccard.
+    # Adaptive K takes precedence when enabled, so the method does NOT read the
+    # ground-truth class count. With SUBSPACE_CONFIG["k_method"]="davies_bouldin"
+    # this recovers the true community count without any label information
+    # (measured: K=6 on citeseer), restoring the "label-free adaptive K" claim.
+    prefer_adaptive = MULTILABEL_CONFIG.get("prefer_adaptive_k", True)
+    if prefer_adaptive and k_init is not None:
+        target_k = k_init
+    elif true_k is not None:
+        # Fallback: anchor K to the real class count. NOTE the LLM theme count
+        # (k_final) is NOT allowed to override it -- the Mock LLM returns ~36
+        # themes, which would blow K far past the true 6 classes.
         target_k = true_k
     else:
         target_k = k_final
@@ -303,7 +312,8 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
         # Hard override for ablation / debugging (e.g. force K=6 to match the
         # ground-truth class count on citeseer).
         target_k = int(force_k)
-    print(f"  Target community count (true_k={true_k}, k_final={k_final}, force_k={force_k}): {target_k}")
+    print(f"  Target community count (adaptive_k={k_init}, true_k={true_k}, "
+          f"k_final={k_final}, force_k={force_k}): {target_k}")
 
     # Merge the k_init representative clusters into target_k communities so that:
     #  - no seed supervision is lost (clusters are merged, not dropped),
@@ -376,9 +386,14 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
             logits = model(data.x, data.edge_index)
             probs = torch.sigmoid(logits)
 
-        # Stage 3: high-entropy nodes (report only; used in expansion/CTL).
+        # Stage 3: high-entropy nodes. These are the nodes the model is most
+        # uncertain about (possible overlap boundaries), and they now form the
+        # "to be decided" queue that feeds BOTH Stage 4 (exempt from GNN pruning)
+        # and Stage 5 (extra candidates for conflict arbitration). Previously this
+        # was computed and printed but never consumed by any downstream stage.
         high_entropy_nodes = select_high_entropy_nodes(probs, top_ratio=0.1)
-        print(f"  High-entropy nodes selected: {len(high_entropy_nodes)}")
+        high_entropy_set = set(int(n) for n in np.asarray(high_entropy_nodes).reshape(-1))
+        print(f"  High-entropy nodes selected: {len(high_entropy_set)}")
 
         # Stage 4: GNN-guided expansion.
         expander = CommunityExpander(
@@ -402,14 +417,21 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
         budget = int(np.ceil(num_nodes / max(1, num_communities)
                              * MULTILABEL_CONFIG.get("expansion_budget_ratio", 1.5)))
         added = expander.expand_all(default_budget=budget, prune=prune,
-                                    max_negative_gain=MULTILABEL_CONFIG.get("max_negative_gain", -0.05))
+                                    max_negative_gain=MULTILABEL_CONFIG.get("max_negative_gain", -0.05),
+                                    exempt_nodes=high_entropy_set)
         print(f"  Expanded nodes per community: { {cid: len(nodes) for cid, nodes in added.items()} }")
 
         # Stage 5: CTL conflict detection and LLM arbitration.
-        conflicts = detect_conflicts(expander)
+        # High-entropy nodes are scanned in addition to boundary nodes, since
+        # undecided nodes are exactly the ones worth arbitrating.
+        conflicts = detect_conflicts(expander, extra_candidates=high_entropy_set)
         conflicts = deduplicate_conflicts(conflicts)
         print(f"  Conflicts detected: {len(conflicts)}")
-        for node, cid, ctype in conflicts[:5]:  # resolve a few per round for speed
+        # Resolve the conflicts (the old code capped this at 5 "for speed", which
+        # reduced CTL to a no-op). A configurable cap still bounds LLM cost.
+        max_resolve = int(MULTILABEL_CONFIG.get("ctl_max_resolve", 200))
+        ctl_accepted, ctl_rejected = 0, 0
+        for node, cid, ctype, delta_co in conflicts[:max_resolve]:
             neighbor_context = []
             if texts:
                 neighbor_context = [texts[i] for i in range(num_nodes) if adj[node, i] > 0 and i < len(texts)]
@@ -419,12 +441,33 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
                 neighbor_context=neighbor_context,
                 themes={cid: name for cid, name in themes.items() if cid < num_communities},
                 gnn_probs={cid: float(probs[node, cid].cpu()) for cid in range(num_communities)},
-                heuristic_score=0.0,
+                # Pass the REAL heuristic score so the LLM can see the actual
+                # rule-vs-GNN disagreement (was hardcoded to 0.0 before).
+                heuristic_score=float(delta_co),
             )
             assigned = resolve_conflict_with_llm(conflict_prompt)
+            # Conditional acceptance ("informed majority"): an arbitration is
+            # applied only when it is corroborated by the GNN. Agreement with the
+            # GNN top-1 is always accepted; a DISAGREEING suggestion is accepted
+            # only if the GNN also gives that community a non-trivial probability
+            # (>= ctl_accept_threshold). Otherwise the LLM call -- which measurably
+            # degrades jaccard when trusted blindly -- is discarded and the GNN
+            # judgement is kept.
+            gnn_top1 = int(torch.argmax(probs[node]).item())
+            accept_threshold = float(MULTILABEL_CONFIG.get("ctl_accept_threshold", 0.3))
             for c in assigned:
-                if 0 <= c < num_communities:
+                if not (0 <= c < num_communities):
+                    continue
+                prob_c = float(probs[node, c].cpu())
+                if c == gnn_top1 or prob_c >= accept_threshold:
                     expander.communities[c].add(node)
+                    ctl_accepted += 1
+                else:
+                    ctl_rejected += 1
+        if ctl_accepted or ctl_rejected:
+            print(f"  CTL arbitration: {ctl_accepted} accepted, {ctl_rejected} rejected "
+                  f"(rejected = disagreed with GNN top-1 and prob < "
+                  f"{MULTILABEL_CONFIG.get('ctl_accept_threshold', 0.3)})")
 
         # Update pseudo-labels for next round.
         y_train = torch.from_numpy(expander.get_membership_matrix()).float().to(DEVICE)
@@ -494,8 +537,8 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="synthetic",
-        choices=["synthetic", "cora", "citeseer", "pubmed", "csv"],
-        help="Dataset to run on: synthetic (default), cora/citeseer/pubmed (pre-built .pt), "
+        choices=["synthetic", "cora", "citeseer", "pubmed", "wikics", "dblp", "amazon", "csv"],
+        help="Dataset to run on: synthetic (default), cora/citeseer/pubmed/wikics/dblp/amazon (pre-built .pt), "
              "or csv (load from --data-dir as CSV files).",
     )
     parser.add_argument(

@@ -52,16 +52,21 @@ def omega_index(pred_membership: np.ndarray, true_membership: np.ndarray) -> flo
     """
     N = pred_membership.shape[0]
     # Co-membership counts: how many communities two nodes share.
-    pred_co = pred_membership @ pred_membership.T
-    true_co = true_membership @ true_membership.T
+    # Vectorized: the previous implementation used a double Python loop over all
+    # node pairs, which is O(N^2) interpreted iterations -- on pubmed (N=19717)
+    # that is ~1.9e8 iterations and took >10 minutes (and 6+ GB for two float64
+    # [N,N] matrices). Computing the comparison with numpy keeps the same result
+    # but runs in seconds and uses far less memory (float32 matmul + boolean).
+    pred = np.asarray(pred_membership, dtype=np.float32)
+    true = np.asarray(true_membership, dtype=np.float32)
+    pred_co = (pred @ pred.T) > 0
+    true_co = (true @ true.T) > 0
 
-    agreements = 0
+    # Compare only the strict upper triangle (unordered node pairs).
+    agree = np.triu((pred_co == true_co), k=1)
+    agreements = int(np.count_nonzero(agree))
     total_pairs = N * (N - 1) // 2
-    for i in range(N):
-        for j in range(i + 1, N):
-            if (pred_co[i, j] > 0) == (true_co[i, j] > 0):
-                agreements += 1
-    return agreements / total_pairs if total_pairs > 0 else 1.0
+    return float(agreements / total_pairs) if total_pairs > 0 else 1.0
 
 
 def average_jaccard(pred_membership: np.ndarray, true_membership: np.ndarray) -> float:

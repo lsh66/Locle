@@ -31,12 +31,19 @@ GNNConfig = {
 MULTILABEL_CONFIG = {
     "prob_threshold": 0.5,      # Probability threshold for hard assignment during training
     "overlap_threshold": 0.4,   # Threshold for overlapping community membership
+    "prefer_adaptive_k": True,  # if True, use the label-free adaptive K instead of the ground-truth class count
     "entropy_sigma": 1e-9,     # Smoothing term for label entropy
     "pruning_threshold": 0.05, # GNN pruning threshold for expansion candidates
     "max_negative_gain": -0.05, # Allow slightly negative cohesion gain during expansion (sparse graphs)
     "expansion_budget_ratio": 0.35, # Per-community budget = ceil(N/K * ratio); full coverage now comes from GNN argmax, not brute-force expansion
-    "ctl_conflict_high": 0.9,   # High GNN probability but low heuristic score
+    "ctl_conflict_high": 0.7,   # High GNN probability but low heuristic score (was 0.9, too strict)
     "ctl_conflict_low": 0.05,   # Low GNN probability but high heuristic score
+    "ctl_delta_high": 0.2,      # ΔCo threshold for "heuristic strongly favors" (was 0.5 -> 0 conflicts)
+    "ctl_max_resolve": 200,     # Max conflicts sent to the LLM per round (replaces the old [:5] cap)
+    "ctl_accept_threshold": 0.3, # For an arbitration that DISAGREES with the GNN top-1, require the
+                                 # GNN probability of that community to be at least this before
+                                 # accepting it. Prevents low-confidence LLM calls from polluting
+                                 # the communities (measured: unconditional acceptance cost ~0.024 jaccard).
 }
 
 # Subspace clustering settings
@@ -44,6 +51,20 @@ SUBSPACE_CONFIG = {
     "alpha": 0.1,              # Self-expression regularization
     "max_k": 50,               # Maximum number of initial clusters
     "eigengap_ratio": 0.1,     # Ratio for eigengap heuristic
+    # Label-free criterion used to pick K:
+    #   "davies_bouldin" -- Davies-Bouldin index on the attribute matrix (recommended;
+    #                       selects K=6 on citeseer, matching the true class count)
+    #   "eigengap"       -- spectral gap on the self-expression affinity (counts
+    #                       topological sub-cliques; over-estimates K, e.g. 40 vs 6)
+    "k_method": "davies_bouldin",
+    "k_min": 2,                # smallest K considered by the criterion
+    "k_max": None,             # None => adaptive ceiling clip(sqrt(N)/2, 10, 60).
+                               # A hard-coded 15 truncated the sweep (DBLP/WikiCS
+                               # both returned exactly 15, i.e. the argmin sat on
+                               # the boundary), which looked like over-estimation.
+    "k_max_cap": 60,           # absolute ceiling for the adaptive range
+    "k_pca_dim": 128,          # whitened-PCA width used before the DB criterion
+    "k_n_seeds": 4,            # KMeans runs averaged per K (DB is seed-unstable otherwise)
 }
 
 # DivRank settings

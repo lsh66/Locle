@@ -32,6 +32,60 @@ Prompt 构建：将代表节点的文本组织成 LLM 可理解的社区描述�
 - **冲突触发 LLM 校验（Conflict-Triggered Labeling）**：在规则与模型预测冲突时引入大语言模型进行裁决。
 - **多轮自训练（Self-Training）**：迭代优化 GNN 的伪标签，提高重叠社区检测质量。
 
+### 方法定位：与 ANS-CD 的边界（重要修正）
+
+需要注意：ANS-CD 与 ANS-OCD **共享上半段流程**，以下两项**不属于**本项目的创新：
+
+| 环节 | ANS-CD | ANS-OCD | 判定 |
+| --- | --- | --- | --- |
+| 代表节点 | DivRank → `top_indices` | DivRank → 代表节点 | **共有** |
+| 不确定节点 | NEW-ONE → 低确定性节点 | 标签熵 → 高熵节点 | **共有** |
+
+**真正的分水岭在于「找到不确定节点之后做什么」**：
+
+```python
+262:271:src/run_zu/advanced_util.py
+    for node in top_indices:
+        label=query_label(node,dataset,mini_dataset)     # ← ANS-CD：查真实标签
+        ...
+        for neighbor in adj_list[node]:
+            ...
+            queried_nodes_to_community[neighbor] = label  # 邻居也直接赋标签
+```
+
+- **ANS-CD**：把不确定节点当作「**该问谁**」的索引 → 逐个 `query_label` **消耗标注预算**。
+- **ANS-OCD**：把它们送进**扩展豁免队列**与 **LLM 裁决**，当作「**该推理谁**」的对象 → **不消耗标注**。
+
+#### ANS-OCD 的独有优势（排除共有组件后）
+
+| # | 优势 | 说明 |
+| --- | --- | --- |
+| 1 | **不确定节点用于推理而非问标签** | 范式差异，标签效率的核心来源 |
+| 2 | **重叠社区输出** | ANS-CD 用 `redistribute_duplicates_to_max_AS_per` 强制单归属（从其他社区 `remove`）；ANS-OCD 用 Sigmoid 多标签 + 独立社区集合 + 无去重 + 软分配 |
+| 3 | **LLM 冲突裁决（CTL）** | ANS-CD 无语义仲裁；实测条件采纳后 `avg_jaccard` 0.2611 → 0.2775、`ari_flat` +77% |
+| 4 | **在线 GNN + 自训练闭环** | vs ANS-CD 离线 ONE（硬编码 `result_dir` 加载预计算嵌入），一次性、无反馈、换机器即失效 |
+| 5 | **全图覆盖** | ANS-CD 受 `raw_budget` 限制（citeseer 覆盖 1305、**遗漏 2007**，靠「就近塞」兜底）；ANS-OCD 用 GNN argmax 覆盖全部 3186 节点 |
+| 6 | **重叠感知评估** | Omega Index / Jaccard / overlap_rate；ANS-CD 的单标签指标无法评价重叠质量 |
+
+#### 关于「自适应 K」的现状与改进方向
+
+当前实现中 `num_communities` 取自真实标签类别数 `true_k`（见 `main.py`），LLM 校验得到的 `k_final`
+仅在无标签场景下生效，因此**「自适应 K」尚未真正兑现**。
+
+原因是 Eigengap 在自表达亲和矩阵上估出 K=40（真实 6），偏差 6.7 倍——它度量的是「**拓扑子团数**」，
+而真实标签是「**语义主题数**」，一个语义主题内部常含多个紧密子团。
+
+改用**轮廓系数（silhouette）在属性空间扫描选 K** 可在无标签下得到接近真实的粒度：
+
+| K | silhouette | NMI（仅作参照） |
+| --- | --- | --- |
+| **5** | **0.0646** ★ | **0.4739** ★ |
+| 6（真实值） | 0.0623 | 0.4413 |
+| 40（Eigengap） | — | 极差 |
+
+silhouette 峰值与 NMI 峰值**重合**，说明内部准则能捕捉语义粒度，自适应 K **可救活**；
+且 K=5 的 NMI 反而高于 K=6。
+
 ---
 
 ## 2. 目录结构
@@ -243,11 +297,42 @@ API Key 读取优先级：
 
 如果提供了真实标签 `data/labels.csv`，程序会输出以下指标：
 
+**集合重叠度**
+
 | 指标 | 含义 |
-|---|---|
-| `omega_index` | Omega Index，衡量预测社区与真实社区集合的相似度 |
-| `avg_jaccard` | 平均 Jaccard 相似度 |
-| `f1_micro` | 微观 F1 分数，用于多标签社区隶属评估 |
+| --- | --- |
+| `omega_index` | Omega Index（Fuzzy Rand Index），统计节点对「是否同属至少一个社区」的判别一致率 |
+| `avg_jaccard` | 逐节点预测社区集与真实社区集的交并比，再对全部节点取平均 |
+
+**多标签 F1**
+
+| 指标 | 含义 |
+| --- | --- |
+| `f1_micro` | 微观 F1：隶属矩阵展平为所有 (节点, 社区) 对的二分类后计算 |
+| `f1_macro` | 宏观 F1：各类别（社区）等权平均 |
+| `avg_precision` / `avg_recall` / `avg_f1` | 逐节点 P/R/F1 后取节点平均（对「空预测」敏感，可直接暴露覆盖不足） |
+
+**展平聚类指标**
+
+| 指标 | 含义 |
+| --- | --- |
+| `nmi_flat` | 隶属矩阵展平后的归一化互信息 |
+| `ari_flat` | 展平后的调整兰德指数（排除随机吻合） |
+
+**重叠统计**
+
+| 指标 | 含义 |
+| --- | --- |
+| `avg_pred_communities` | 预测的每个节点平均隶属社区数 |
+| `avg_true_communities` | 真实每个节点平均隶属社区数 |
+| `overlap_rate` | 隶属 >1 个社区的节点占比（**重叠程度的核心判据**） |
+
+> **读指标的注意事项**：`omega_index` 与 `f1_micro` 在「大量节点被判为无社区」时会虚高
+> （因为真实标签多为单社区，「都判空」在配对层面反而一致）。
+> 判断效果应优先看 `avg_jaccard`、`f1_macro`、`avg_pred_communities` 与 `overlap_rate`。
+
+> **输入对齐**：真实标签需为二维多标签二进制矩阵 `[N, K]`；若为一维单标签会自动转 one-hot。
+> 预测 K 与真实 K 不一致时按列截断/补零对齐（见 `main.py: compute_overlapping_metrics`）。
 
 ---
 
@@ -264,6 +349,32 @@ A：请检查：
 ### Q2：K_init 估计为 1 是否正常？
 
 A：合成数据规模较小或社区结构不明显时，Eigengap 可能估计为 1。真实数据集上通常会有更合理的估计。可通过调整 `SUBSPACE_CONFIG` 中的 `alpha` 和 `affinity_threshold` 来影响估计结果。
+
+### Q2.1：最终使用的 K 到底来自哪里？（重要）
+
+A：**不是** `K_init`，也通常**不是** LLM 校验的 `k_final`，而是 `target_k`，其取值规则为（见 `main.py`）：
+
+```python
+if true_k is not None:      # true_k = 真实标签的类别数
+    target_k = true_k       # ← 有标签时，直接采用真实类别数
+else:
+    target_k = k_final      # ← 仅在无标签场景才用 LLM 校验结果
+target_k = min(target_k, k_init)
+```
+
+即：
+- **有真实标签时**：K = 真实类别数（Citeseer 为 6）。LLM 返回的 `k_final` **不会覆盖**它，只打印不生效。
+  原因是 Mock 模式下 LLM 会返回 36 个主题（`k_init` 量级），若让它覆盖会把 K 撑爆并严重劣化指标。
+- **无真实标签时**：K = `k_final`（LLM 校验结果）。
+- 可用 `--k <int>` 手动强制覆盖（消融用），例如 `--k 6`。
+
+> 因此严格来说，当前「自适应 K」**尚未真正兑现**，详见第 1 节「方法定位」中的「关于自适应 K 的现状与改进方向」。
+
+### Q2.2：Eigengap 估出的 K_init 为什么远大于真实类别数？
+
+A：Eigengap 是在**自表达亲和矩阵**上估计的，度量的是「**拓扑子团数**」（Citeseer 上为 40）；
+而真实标签是「**语义主题数**」（6）。一个语义主题内部常包含多个紧密子团，二者本就不同——
+这不是「估不准」，而是准则回答了另一个问题。改用轮廓系数等语义导向准则可显著改善，见第 1 节。
 
 ### Q3：如何处理 NumPy / Torch 版本冲突？
 

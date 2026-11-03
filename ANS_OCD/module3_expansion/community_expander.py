@@ -303,7 +303,8 @@ class CommunityExpander:
 
     def expand_community(self, cid: int, budget: int, prune: bool = True,
                           max_negative_gain: float = 0.0,
-                          max_candidates: int = 200) -> List[int]:
+                          max_candidates: int = 200,
+                          exempt_nodes: Optional[Set[int]] = None) -> List[int]:
         """
         Greedily expand a single community within the given budget.
 
@@ -335,14 +336,22 @@ class CommunityExpander:
         """
         added_nodes = []
         st = self._stats[cid]
+        exempt = exempt_nodes or set()
         for _ in range(budget):
             candidates = self._boundary_candidates(cid)
             if not candidates:
                 break
             # GNN-guided pruning: keep only candidates with high membership
             # probability. Skipped when prune=False (early rounds).
+            # Nodes in `exempt_nodes` (the high-label-entropy set) are EXEMPT from
+            # pruning: they are precisely the nodes the GNN is uncertain about, so
+            # their probability is low by construction. Pruning them would mean the
+            # most undecided nodes never get assigned, defeating Stage 3's purpose.
             if prune:
-                candidates = [n for n in candidates if self.probs[n, cid] >= self.pruning_threshold]
+                candidates = [
+                    n for n in candidates
+                    if self.probs[n, cid] >= self.pruning_threshold or n in exempt
+                ]
                 if not candidates:
                     break
 
@@ -372,7 +381,8 @@ class CommunityExpander:
     def expand_all(self, budgets: Optional[Dict[int, int]] = None,
                    default_budget: int = 50, prune: bool = True,
                    max_negative_gain: float = 0.0,
-                   max_candidates: int = 200) -> Dict[int, List[int]]:
+                   max_candidates: int = 200,
+                   exempt_nodes: Optional[Set[int]] = None) -> Dict[int, List[int]]:
         """
         Expand all communities. Each community can have its own budget.
 
@@ -388,6 +398,8 @@ class CommunityExpander:
             Negative cohesion floor passed to ``expand_community``.
         max_candidates : int, default 200
             Max candidates scored per expansion step (performance guard).
+        exempt_nodes : set of int, optional
+            Nodes exempt from GNN probability pruning (high-entropy nodes).
 
         Returns
         -------
@@ -401,7 +413,8 @@ class CommunityExpander:
             budget = budgets.get(cid, default_budget) if budgets else default_budget
             added = self.expand_community(cid, budget, prune=prune,
                                           max_negative_gain=max_negative_gain,
-                                          max_candidates=max_candidates)
+                                          max_candidates=max_candidates,
+                                          exempt_nodes=exempt_nodes)
             added_by_community[cid] = added
         return added_by_community
 
