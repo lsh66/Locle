@@ -1,6 +1,9 @@
 DATA_PATH: data
-OPENAI_KEY: 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
-ZHIPU_KEY: 0c15ffc0e3e04ad5b87565d05153fd37.MNMKv132gGRhtkHZ
+# API keys are NOT stored here. Inject them via environment variables:
+#   ZHIPU_API_KEY  - used by ANS-OCD (LLM_CONFIG["provider"] = "zhipu")
+#   OPENAI_API_KEY - used by the legacy ANS-CD code in src/ (and provider="openai")
+# Windows PowerShell: $env:ZHIPU_API_KEY = "<your-key>"
+# Windows cmd:        set ZHIPU_API_KEY=<your-key>
 PALM_KEY: none
 LOGIT_PATH: src/
 PARTITIONS: data/partitions

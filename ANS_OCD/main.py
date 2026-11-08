@@ -15,7 +15,7 @@ Author: ANS-OCD project
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -132,14 +132,26 @@ def compute_overlapping_metrics(pred_communities: List[List[int]],
         omega_index,
         average_jaccard,
         overlapping_f1,
+        hungarian_align_membership,
     )
 
+    labels_np = labels.detach().cpu().numpy() if hasattr(labels, "numpy") else np.asarray(labels)
     pred_membership = membership_matrix_from_sets(pred_communities, num_nodes)
-    true_membership = _membership_from_labels(
-        labels.detach().cpu().numpy() if hasattr(labels, "numpy") else np.asarray(labels),
-        num_communities,
-        num_nodes,
-    )
+    match_score = None
+    if MULTILABEL_CONFIG.get("eval_hungarian_align", False):
+        # Keep the full ground-truth width (no column truncation) and align the
+        # predicted communities to their best-matching true communities.
+        if labels_np.ndim == 1:
+            k_true = int(labels_np.max()) + 1 if labels_np.size else 0
+            gt = np.zeros((num_nodes, k_true), dtype=np.float32)
+            valid = (labels_np >= 0) & (labels_np < k_true)
+            gt[np.arange(num_nodes)[valid], labels_np[valid]] = 1.0
+        else:
+            gt = (labels_np > 0).astype(np.float32)
+        pred_membership, match_score = hungarian_align_membership(pred_membership, gt)
+        true_membership = gt
+    else:
+        true_membership = _membership_from_labels(labels_np, num_communities, num_nodes)
 
     f1_scores = overlapping_f1(pred_membership, true_membership)
 
@@ -183,16 +195,27 @@ def compute_overlapping_metrics(pred_communities: List[List[int]],
         "avg_true_communities": float(np.mean(true_counts)),
         "overlap_rate": overlap_rate,
     }
+    if match_score is not None:
+        metrics["hungarian_match_jaccard"] = float(match_score)
+        metrics["avg_gt_overlap_rate"] = float((true_counts > 1).sum() / num_nodes)
+        metrics["k_pred"] = float(len(pred_communities))
+        metrics["k_true"] = float(true_membership.shape[1])
     return metrics
 
 
 def _train_gnn_one_epoch(model: nn.Module, data, y_train: torch.Tensor,
                          optimizer: torch.optim.Optimizer) -> float:
-    """Single training step using BCEWithLogitsLoss."""
+    """Single training step using BCEWithLogitsLoss (optional pos_weight)."""
     model.train()
     optimizer.zero_grad()
     logits = model(data.x, data.edge_index)
-    loss = multilabel_gnn_loss(logits, y_train)
+    pos_weight = None
+    clip = float(MULTILABEL_CONFIG.get("pos_weight_clip", 0.0) or 0.0)
+    if clip > 0:
+        pos = y_train.sum(dim=0)
+        neg = y_train.shape[0] - pos
+        pos_weight = (neg / pos.clamp(min=1.0)).clamp(max=clip)
+    loss = multilabel_gnn_loss(logits, y_train, pos_weight=pos_weight)
     loss.backward()
     optimizer.step()
     return float(loss.item())
@@ -203,7 +226,8 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
                 use_text_embeddings: bool = True,
                 return_synthetic: bool = False,
                 dataset: str = "synthetic",
-                force_k: int = None):
+                force_k: int = None,
+                diagnostics: Optional[Dict] = None):
     """
     Run the full ANS-OCD pipeline.
 
@@ -360,16 +384,54 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
         weight_decay=GNNConfig["weight_decay"],
     )
 
-    # Build initial pseudo-labels from representative seeds (one-hot per community).
-    # Seeds are already merged into num_communities communities, so no wrapping or
-    # dropping is needed -- every seed contributes supervision to its community.
+    # Build initial pseudo-labels from representative seeds.
+    # "argmax" mode: legacy one-hot supervision (one community per seed), which
+    # trains an almost mutually-exclusive classifier and caps overlap.
+    # "soft_seed" mode: soft multi-label targets derived from attribute-to-prototype
+    # cosine similarity, propagated to 1-hop neighbours, so the GNN actually
+    # learns that a node can belong to several communities.
     y_train = torch.zeros((num_nodes, num_communities), dtype=torch.float32, device=DEVICE)
-    for cid, nodes in representatives.items():
-        if cid >= num_communities:
-            continue
-        for n in nodes:
-            if 0 <= n < num_nodes:
-                y_train[n, cid] = 1.0
+    if MULTILABEL_CONFIG.get("soft_seed", False):
+        attr_unit = attr / (np.linalg.norm(attr, axis=1, keepdims=True) + 1e-12)
+        protos = np.zeros((num_communities, attr.shape[1]), dtype=np.float32)
+        for cid in range(num_communities):
+            ns = representatives.get(cid, [])
+            protos[cid] = attr[ns].mean(axis=0) if ns else attr.mean(axis=0)
+        proto_unit = protos / (np.linalg.norm(protos, axis=1, keepdims=True) + 1e-12)
+        sim = attr_unit @ proto_unit.T  # [N, K]
+        lo, hi = MULTILABEL_CONFIG.get("soft_seed_pos_clip", (0.2, 0.6))
+        topk = max(1, min(int(MULTILABEL_CONFIG.get("soft_seed_topk", 3)), num_communities))
+        order = np.argsort(-sim, axis=1)[:, :topk]
+        vals = np.take_along_axis(sim, order, axis=1)
+        # Only sufficiently similar prototypes become weak positive targets;
+        # the rest stay 0 so the soft labels remain sparse.
+        vals = np.where(vals > lo, np.clip(vals, lo, hi), 0.0)
+        soft = np.zeros((num_nodes, num_communities), dtype=np.float32)
+        rows = np.arange(num_nodes)[:, None]
+        soft[rows, order] = vals.astype(np.float32)
+        seed_ids = set()
+        for cid, nodes in representatives.items():
+            if cid >= num_communities:
+                continue
+            for n in nodes:
+                if 0 <= n < num_nodes:
+                    soft[n, cid] = 1.0
+                    seed_ids.add(int(n))
+        w = float(MULTILABEL_CONFIG.get("soft_seed_neighbor_weight", 0.4))
+        if w > 0:
+            for n in seed_ids:
+                nb = np.where(adj[n] > 0)[0]
+                if len(nb):
+                    soft[nb] = np.maximum(soft[nb], w * soft[n])
+        y_train = torch.from_numpy(np.clip(soft, 0.0, 1.0)).float().to(DEVICE)
+        print(f"  Soft-seed supervision: avg targets/node={soft.sum(axis=1).mean():.3f}")
+    else:
+        for cid, nodes in representatives.items():
+            if cid >= num_communities:
+                continue
+            for n in nodes:
+                if 0 <= n < num_nodes:
+                    y_train[n, cid] = 1.0
 
     # --- Stage 3-6: multi-round self-training ---
     prev_probs = None
@@ -469,9 +531,13 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
                   f"(rejected = disagreed with GNN top-1 and prob < "
                   f"{MULTILABEL_CONFIG.get('ctl_accept_threshold', 0.3)})")
 
-        # Update pseudo-labels for next round.
+        # Update pseudo-labels for next round. Keep this conservative in BOTH
+        # modes: feeding relative multi-membership back into y_train creates a
+        # positive feedback loop (more positive columns -> flatter sigmoid ->
+        # even more columns pass the threshold), which collapsed every node into
+        # m_max communities on BlogCatalog. The relative rule belongs to the
+        # final decision only; the training signal stays sparse.
         y_train = torch.from_numpy(expander.get_membership_matrix()).float().to(DEVICE)
-        # Also include high-confidence GNN predictions.
         y_train = torch.maximum(y_train, (probs >= MULTILABEL_CONFIG["prob_threshold"]).float())
 
         # Convergence check.
@@ -504,14 +570,37 @@ def run_ans_ocd(data_dir: Path = DATA_DIR,
     # exactly the right assignment and is fully vectorized (O(N*K), very fast) --
     # unlike growing communities one node at a time in the expander, which scales
     # as O(budget^2 * feature_dim) and becomes unusably slow.
-    argmax_membership = np.zeros_like(final_probs, dtype=np.float32)
-    argmax_membership[np.arange(num_nodes), final_probs.argmax(axis=1)] = 1.0
-
-    final_membership = np.maximum(base_membership, argmax_membership)
-    # Keep high-confidence multi-label predictions so genuine overlaps survive.
-    gnn_hard = (final_probs >= MULTILABEL_CONFIG["prob_threshold"]).astype(np.float32)
-    final_membership = np.maximum(final_membership, gnn_hard)
+    if MULTILABEL_CONFIG.get("overlap_mode", "argmax") == "relative":
+        # Relative-threshold overlapping decision: each node keeps up to m_max
+        # communities whose probability is within alpha of its top probability.
+        from ANS_OCD.utils.metrics import relative_membership
+        multi_membership = relative_membership(
+            final_probs,
+            float(MULTILABEL_CONFIG.get("overlap_alpha", 0.7)),
+            int(MULTILABEL_CONFIG.get("overlap_m_max", 3)),
+        )
+        final_membership = np.maximum(base_membership, multi_membership)
+        print(f"  Overlap decision (relative): alpha="
+              f"{MULTILABEL_CONFIG.get('overlap_alpha', 0.7)}, "
+              f"m_max={MULTILABEL_CONFIG.get('overlap_m_max', 3)}, "
+              f"avg_communities/node={final_membership.sum(axis=1).mean():.4f}")
+    else:
+        argmax_membership = np.zeros_like(final_probs, dtype=np.float32)
+        argmax_membership[np.arange(num_nodes), final_probs.argmax(axis=1)] = 1.0
+        final_membership = np.maximum(base_membership, argmax_membership)
+        # Keep high-confidence multi-label predictions so genuine overlaps survive.
+        gnn_hard = (final_probs >= MULTILABEL_CONFIG["prob_threshold"]).astype(np.float32)
+        final_membership = np.maximum(final_membership, gnn_hard)
     communities = [np.where(final_membership[:, cid] == 1.0)[0].tolist() for cid in range(num_communities)]
+
+    if diagnostics is not None:
+        diagnostics.update({
+            "final_probs": final_probs,
+            "base_membership": base_membership,
+            "final_membership": final_membership,
+            "num_nodes": num_nodes,
+            "num_communities": num_communities,
+        })
 
     print("\n[ANS-OCD] Final overlapping communities:")
     for cid, nodes in enumerate(communities):
@@ -537,9 +626,10 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="synthetic",
-        choices=["synthetic", "cora", "citeseer", "pubmed", "wikics", "dblp", "amazon", "csv"],
-        help="Dataset to run on: synthetic (default), cora/citeseer/pubmed/wikics/dblp/amazon (pre-built .pt), "
-             "or csv (load from --data-dir as CSV files).",
+        choices=["synthetic", "cora", "citeseer", "pubmed", "wikics", "dblp", "amazon",
+                 "ppi", "ppi_bp", "blogcatalog", "facebook", "csv"],
+        help="Dataset to run on: synthetic (default), cora/citeseer/pubmed/wikics/dblp/amazon/ppi/"
+             "ppi_bp/blogcatalog/facebook (pre-built .pt), or csv (load from --data-dir as CSV files).",
     )
     parser.add_argument(
         "--data-dir",
@@ -565,7 +655,35 @@ if __name__ == "__main__":
         help="Force the number of communities K (overrides auto-estimated target_k). "
              "Useful for ablation, e.g. --k 6 on citeseer to match ground-truth classes.",
     )
+    parser.add_argument(
+        "--overlap-mode", choices=["argmax", "relative"], default=None,
+        help="Overlap decision: argmax (legacy single-label) or relative (multi-membership).",
+    )
+    parser.add_argument("--overlap-alpha", type=float, default=None,
+                        help="Relative threshold: keep p >= alpha * max(p).")
+    parser.add_argument("--overlap-m-max", type=int, default=None,
+                        help="Max communities per node in relative mode.")
+    parser.add_argument("--soft-seed", action="store_true",
+                        help="Use soft multi-label seed supervision instead of one-hot.")
+    parser.add_argument("--pos-weight-clip", type=float, default=None,
+                        help="Enable BCE pos_weight with this cap (0 disables).")
+    parser.add_argument("--hungarian-eval", action="store_true",
+                        help="Measurement only: align pred/GT communities (no GT truncation).")
     args = parser.parse_args()
+
+    # Defaults in config.py keep the legacy behaviour unchanged.
+    if args.overlap_mode is not None:
+        MULTILABEL_CONFIG["overlap_mode"] = args.overlap_mode
+    if args.overlap_alpha is not None:
+        MULTILABEL_CONFIG["overlap_alpha"] = args.overlap_alpha
+    if args.overlap_m_max is not None:
+        MULTILABEL_CONFIG["overlap_m_max"] = args.overlap_m_max
+    if args.soft_seed:
+        MULTILABEL_CONFIG["soft_seed"] = True
+    if args.pos_weight_clip is not None:
+        MULTILABEL_CONFIG["pos_weight_clip"] = args.pos_weight_clip
+    if args.hungarian_eval:
+        MULTILABEL_CONFIG["eval_hungarian_align"] = True
 
     membership, metrics = run_ans_ocd(
         data_dir=args.data_dir,

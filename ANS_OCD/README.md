@@ -287,9 +287,25 @@ LLM_CONFIG = {
 - `provider="zhipu"`：使用智谱 AI API。
 - `provider="openai"`：使用 OpenAI API（需安装 `openai==0.28`）。
 
-API Key 读取优先级：
-1. 环境变量：`ZHIPU_API_KEY` / `OPENAI_API_KEY`
-2. 项目根目录 `config.yaml` 中的 `ZHIPU_KEY` / `OPENAI_KEY`
+API Key **只从环境变量读取**，`config.yaml` 中不存放任何密钥（该文件已纳入版本控制）：
+
+```powershell
+# Windows PowerShell（当前会话）
+$env:ZHIPU_API_KEY  = "<your-zhipu-key>"   # ANS-OCD，provider="zhipu"
+$env:OPENAI_API_KEY = "<your-openai-key>"  # ANS-CD 或 provider="openai"
+
+# 永久生效（新开终端后仍有效）
+setx ZHIPU_API_KEY  "<your-zhipu-key>"
+setx OPENAI_API_KEY "<your-openai-key>"
+```
+
+```bash
+# Linux / macOS
+export ZHIPU_API_KEY="<your-zhipu-key>"
+export OPENAI_API_KEY="<your-openai-key>"
+```
+
+未设置时 `ctl_mechanism.py` 会打印提示并回退到 Mock 模式，不会报错中断。
 
 ---
 

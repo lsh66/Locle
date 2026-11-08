@@ -429,6 +429,185 @@ def estimate_k_via_davies_bouldin(X: np.ndarray, k_min: int = 2,
     return int(best_k)
 
 
+def _sparse_normalized_adjacency(adj):
+    """Symmetrise the graph and return (A, A_sym, degrees, 2m) as sparse CSR."""
+    if sp.issparse(adj):
+        A = adj.tocsr().astype(np.float64)
+    else:
+        A = sp.csr_matrix(np.asarray(adj, dtype=np.float64))
+    A = (A + A.T) * 0.5
+    A.setdiag(0.0)
+    A.eliminate_zeros()
+    deg = np.asarray(A.sum(axis=1)).ravel()
+    two_m = max(float(deg.sum()), 1.0)
+    d_inv = 1.0 / np.sqrt(np.maximum(deg, 1.0))
+    D = sp.diags(d_inv)
+    A_sym = (D @ A @ D).tocsr()
+    return A, A_sym, deg, two_m
+
+
+def _spectral_basis(A_sym, k_basis: int, random_state: int = 42):
+    """Low-rank spectral embedding of the normalized adjacency (spectral method).
+
+    ``randomized_svd`` on a sparse matrix gives the leading left singular vectors,
+    i.e. the low-frequency structural coordinates used by spectral clustering.
+    Falls back to ``eigsh`` and finally to ``None`` (attribute prior only).
+    """
+    n = A_sym.shape[0]
+    k = int(max(2, min(k_basis, n - 1)))
+    try:
+        from sklearn.utils.extmath import randomized_svd
+        U, S, _ = randomized_svd(A_sym.astype(np.float32), n_components=k,
+                                 n_iter=4, random_state=random_state)
+        return np.ascontiguousarray((U * S).astype(np.float32))
+    except Exception:
+        try:
+            vals, vecs = eigsh(A_sym, k=k, which="LA", tol=1e-3)
+            return np.ascontiguousarray(np.real(vecs[:, np.argsort(-vals)]))
+        except Exception:
+            return None
+
+
+def _softmax_sqdist(Z: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """Soft assignment from squared distances with a data-adaptive bandwidth."""
+    d2 = (np.sum(Z * Z, axis=1)[:, None] + np.sum(C * C, axis=1)[None, :]
+          - 2.0 * (Z @ C.T))
+    np.maximum(d2, 0.0, out=d2)
+    sigma = float(np.median(d2.min(axis=1)))
+    if sigma <= 1e-9:
+        sigma = max(float(d2.max()), 1e-9) * 0.1
+    P = np.exp(-d2 / (2.0 * sigma))
+    P /= (P.sum(axis=1, keepdims=True) + 1e-12)
+    return P
+
+
+def _overlap_membership(X, basis, A_sym, k, attr_weight, smooth_steps,
+                        alpha, m_max, seed):
+    """Build a soft OVERLAPPING membership matrix U in [0,1]^{N x k}.
+
+    Three ingredients:
+      * spectral coordinates (low-rank embedding of the normalized adjacency),
+      * an attribute-derived membership prior (soft KMeans posterior),
+      * low-pass graph smoothing, so neighbours share membership mass.
+    Rows are sparsified with a relative threshold, keeping up to ``m_max``
+    communities per node, then renormalised so a node can belong to several
+    communities without the matrix becoming dense.
+    """
+    n = X.shape[0]
+    # n_init=3 is enough here: centres only define a soft membership prior,
+    # not a hard partition that K is judged on. Keeps the K sweep affordable.
+    km_a = KMeans(n_clusters=k, random_state=seed, n_init=3).fit(X)
+    P = _softmax_sqdist(X, km_a.cluster_centers_)
+    if basis is not None and basis.shape[1] >= k:
+        E = np.ascontiguousarray(basis[:, :k])
+        E = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-12)
+        km_s = KMeans(n_clusters=k, random_state=seed, n_init=3).fit(E)
+        S = _softmax_sqdist(E, km_s.cluster_centers_)
+        U = (1.0 - attr_weight) * S + attr_weight * P
+    else:
+        U = P
+    for _ in range(max(0, smooth_steps)):
+        U = 0.5 * U + 0.5 * np.asarray(A_sym @ U)
+    U = np.maximum(U, 0.0)
+
+    m = max(1, min(int(m_max), k))
+    order = np.argsort(-U, axis=1)[:, :m]
+    top = np.take_along_axis(U, order, axis=1)
+    vals = np.where(top >= alpha * top[:, :1], top, 0.0)
+    Us = np.zeros_like(U)
+    np.put_along_axis(Us, order, vals, axis=1)
+    rows = np.arange(n)
+    Us[rows, order[:, 0]] = np.maximum(Us[rows, order[:, 0]], top[:, 0])
+    Us /= (Us.sum(axis=1, keepdims=True) + 1e-12)
+    return Us
+
+
+def _overlapping_modularity(A, U, deg, two_m, k: int = 0) -> float:
+    """Fuzzy/overlapping modularity with a K-normalised null model.
+
+    With one-hot rows this reduces to Newman modularity. With row-normalised
+    SOFT rows the plain version is biased: ``sum_c vol_c`` stays fixed at 2m, so
+    ``sum_c vol_c^2`` falls like 1/K and modularity drifts upward with K even
+    when the partition gets worse. Multiplying the null term by K restores the
+    uniform-partition baseline (same expectation for every K).
+    """
+    AU = A @ U
+    intra = float((U * AU).sum())
+    vol = U.T @ deg
+    k_factor = float(k) if k and k > 0 else 1.0
+    return (intra - k_factor * float(vol @ vol) / two_m) / two_m
+
+
+def estimate_k_via_overlap_modularity(X: np.ndarray, adj,
+                                      k_min: int = 2, k_max: Optional[int] = None,
+                                      cap: int = 80, random_state: int = 42,
+                                      n_seeds: int = 1, max_dim: int = 128,
+                                      attr_weight: float = 0.5,
+                                      smooth_steps: int = 2,
+                                      alpha: float = 0.5,
+                                      m_max: int = 4,
+                                      penalty_lambda: float = 0.35,
+                                      return_info: bool = False):
+    """Choose K by an OVERLAP-AWARE criterion instead of Davies-Bouldin.
+
+    For each candidate K we build a soft overlapping membership matrix from the
+    spectral embedding + attribute membership prior + graph smoothing, score it
+    with fuzzy modularity, and subtract a complexity penalty that grows with K
+    (otherwise modularity keeps improving by splitting communities). The K with
+    the highest penalised score wins.
+
+    ``cap`` is deliberately larger than the DB ceiling: on PPI-BP / BlogCatalog
+    the true community counts (50 / 39) are above the old ``sqrt(N)/2`` ceiling,
+    so DB could never have reached them even with a better criterion.
+    """
+    X = _preprocess_for_db(X, max_dim=max_dim, random_state=random_state)
+    n = X.shape[0]
+    A, A_sym, deg, two_m = _sparse_normalized_adjacency(adj)
+    if k_max is None:
+        k_max = int(np.clip(round(0.9 * math.sqrt(n)), 10, cap))
+    k_max = int(min(k_max, max(k_min + 1, n - 1)))
+    ks = _k_grid(k_min, k_max)
+    basis = _spectral_basis(A_sym, min(k_max + 2, n - 1), random_state)
+    seeds = [random_state + 1000 * i for i in range(max(1, n_seeds))]
+
+    Q: Dict[int, float] = {}
+    share: Dict[int, float] = {}
+    for k in ks:
+        vals = []
+        for s in seeds:
+            U = _overlap_membership(X, basis, A_sym, k, attr_weight,
+                                    smooth_steps, alpha, m_max, s)
+            vals.append(_overlapping_modularity(A, U, deg, two_m))
+        Q[k] = float(np.mean(vals))
+        lab = U.argmax(axis=1)
+        share[k] = float(np.bincount(lab, minlength=k).max() / n)
+
+    q_vals = np.array([Q[k] for k in ks], dtype=np.float64)
+    q_range = float(q_vals.max() - q_vals.min()) if q_vals.size else 0.0
+    denom = max(k_max - k_min, 1)
+    scores = {k: Q[k] - penalty_lambda * q_range * (k - k_min) / denom for k in ks}
+    ranked = sorted(ks, key=lambda k: -scores[k])
+    best_k = ranked[0]
+    knee = _knee_point(ks, [-scores[k] for k in ks])
+
+    degenerate = False
+    for cand in [best_k] + ranked[:3]:
+        if share.get(cand, 0.0) <= 0.90:
+            best_k = cand
+            break
+        degenerate = True
+
+    if return_info:
+        return int(best_k), {
+            "k_max_used": k_max, "expanded": 0, "scores": scores,
+            "modularity": Q, "knee": knee, "argmin": ranked[0],
+            "degenerate": degenerate, "max_share": share.get(best_k),
+            "max_share_curve": share, "q_range": q_range,
+            "spectral_ok": basis is not None,
+        }
+    return int(best_k)
+
+
 class SubspaceClusterEstimator:
     """
     Wrapper that combines joint-feature construction, self-expression, and
@@ -477,7 +656,26 @@ class SubspaceClusterEstimator:
         self.attr_ = attr_matrix
         self.S = compute_self_expression_matrix(F, alpha=self.alpha,
                                                 threshold_ratio=self.threshold_ratio)
-        if self.k_method == "davies_bouldin" and attr_matrix is not None:
+        if self.k_method == "overlap_modularity" and attr_matrix is not None:
+            self.k_init, self.k_info = estimate_k_via_overlap_modularity(
+                np.asarray(attr_matrix), adj_matrix,
+                k_min=self.k_min, k_max=self.k_max, n_seeds=1,
+                max_dim=SUBSPACE_CONFIG.get("k_pca_dim", 128),
+                cap=SUBSPACE_CONFIG.get("om_k_max_cap", 80),
+                attr_weight=SUBSPACE_CONFIG.get("om_attr_weight", 0.5),
+                smooth_steps=SUBSPACE_CONFIG.get("om_smooth_steps", 2),
+                alpha=SUBSPACE_CONFIG.get("om_alpha", 0.5),
+                m_max=SUBSPACE_CONFIG.get("om_m_max", 4),
+                penalty_lambda=SUBSPACE_CONFIG.get("om_penalty_lambda", 0.35),
+                return_info=True)
+            print(f"[K-est] OverlapMod picked K={self.k_init} "
+                  f"(ceiling={self.k_info['k_max_used']}, "
+                  f"knee={self.k_info.get('knee')}, best={self.k_info.get('argmin')}, "
+                  f"spectral={self.k_info.get('spectral_ok')}, "
+                  f"degenerate_rejected={self.k_info['degenerate']}, "
+                  f"max_share={self.k_info.get('max_share')})")
+            self.spectrum = None
+        elif self.k_method == "davies_bouldin" and attr_matrix is not None:
             # Attribute-space criterion: recovers the semantic community count.
             self.k_init, self.k_info = estimate_k_via_davies_bouldin(
                 np.asarray(attr_matrix), k_min=self.k_min, k_max=self.k_max,

@@ -41,7 +41,7 @@ def one_dim(args, data, ensemble_ca_matrix, device, ensemble_pred, stage, ensemb
     high_confi_label_num = 0
     high_confi_label_right_num = 0
     params_dict = load_yaml(args.yaml_path)
-    key = params_dict['OPENAI_KEY']
+    key = os.environ.get('OPENAI_API_KEY', '')
     data_path = params_dict['DATA_PATH']
     exp = Experiment(data, key, data_path)
     exps = ['pair']

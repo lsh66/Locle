@@ -119,6 +119,61 @@ def overlapping_f1(pred_membership: np.ndarray, true_membership: np.ndarray) -> 
     }
 
 
+def relative_membership(probs: np.ndarray, alpha: float = 0.7,
+                        m_max: int = 3, ensure_top1: bool = True) -> np.ndarray:
+    """Overlapping membership: keep community c when p[n,c] >= alpha*max_j p[n,j].
+
+    A relative rule is needed because a fixed 0.5 threshold almost never fires
+    on the non-top-1 columns of a K-community sigmoid output, which is exactly
+    why the legacy argmax decision collapses to one community per node.
+    """
+    probs = np.asarray(probs, dtype=np.float32)
+    n, k = probs.shape
+    if k == 0:
+        return np.zeros((n, 0), dtype=np.float32)
+    m = max(1, min(int(m_max), k))
+    order = np.argsort(-probs, axis=1)[:, :m]
+    top = np.take_along_axis(probs, order, axis=1)
+    pmax = top[:, :1]
+    keep = (top >= alpha * pmax) & (pmax > 0) & (top > 0)
+    vals = np.where(keep, np.clip(top, 0.0, 1.0), 0.0).astype(np.float32)
+    out = np.zeros((n, k), dtype=np.float32)
+    rows = np.arange(n)[:, None]
+    out[rows, order] = vals
+    if ensure_top1:
+        out[np.arange(n), order[:, 0]] = 1.0
+    return (out > 0).astype(np.float32)
+
+
+def hungarian_align_membership(pred_membership: np.ndarray,
+                               true_membership: np.ndarray):
+    """Align predicted communities to GT communities by best Jaccard.
+
+    Returns (aligned_pred, mean_matched_jaccard); aligned_pred keeps the FULL
+    ground-truth column count so metrics stay valid when K_pred != K_true.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    pred = np.asarray(pred_membership, dtype=np.float32)
+    true = np.asarray(true_membership, dtype=np.float32)
+    n, kp = pred.shape
+    kt = true.shape[1]
+    if kp == 0 or kt == 0:
+        return np.zeros((n, kt), dtype=np.float32), 0.0
+    score = np.zeros((kp, kt), dtype=np.float64)
+    for i in range(kp):
+        a = pred[:, i] > 0
+        for j in range(kt):
+            b = true[:, j] > 0
+            union = np.count_nonzero(a | b)
+            score[i, j] = np.count_nonzero(a & b) / union if union else 0.0
+    ri, ci = linear_sum_assignment(-score)
+    aligned = np.zeros((n, kt), dtype=np.float32)
+    for i, j in zip(ri, ci):
+        aligned[:, j] = pred[:, i]
+    return aligned, (float(score[ri, ci].mean()) if len(ri) else 0.0)
+
+
 def evaluate_overlapping(pred_communities: List[List[int]],
                          true_communities: List[List[int]],
                          num_nodes: int) -> Dict[str, float]:

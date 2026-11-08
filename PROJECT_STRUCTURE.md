@@ -125,7 +125,8 @@ pip install -r requirements.txt
    - 下载数据集并放入 `data/` 目录
 
 3. **配置**
-   - 修改 `config.yaml` 中的 `OPENAI_KEY` 为你的API密钥
+   - 通过环境变量注入 API 密钥（不要写进 `config.yaml`）：
+     `ZHIPU_API_KEY`（ANS-OCD 使用）/ `OPENAI_API_KEY`（`src/` 下的 ANS-CD 代码使用）
 
 4. **运行训练**
    ```bash

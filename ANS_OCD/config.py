@@ -44,6 +44,24 @@ MULTILABEL_CONFIG = {
                                  # GNN probability of that community to be at least this before
                                  # accepting it. Prevents low-confidence LLM calls from polluting
                                  # the communities (measured: unconditional acceptance cost ~0.024 jaccard).
+
+    # --- Overlap-aware assignment (opt-in; defaults reproduce legacy behaviour) ---
+    # "argmax"  : legacy single-label decision (one community per node).
+    # "relative": keep community c when p[n,c] >= overlap_alpha * max_j p[n,j].
+    "overlap_mode": "argmax",
+    "overlap_alpha": 0.7,
+    "overlap_m_max": 3,
+    # Soft multi-label seed targets instead of one-hot, from attribute-to-prototype
+    # cosine similarity, propagated to 1-hop neighbours.
+    "soft_seed": False,
+    "soft_seed_topk": 3,
+    "soft_seed_neighbor_weight": 0.4,
+    "soft_seed_pos_clip": (0.2, 0.6),
+    # BCE pos_weight for sparse positive columns; 0 disables it.
+    "pos_weight_clip": 0.0,
+    # Measurement-only: align pred/GT communities before scoring (no GT truncation).
+    # This is NOT part of the method; it only makes metrics valid when K_pred != K_true.
+    "eval_hungarian_align": False,
 }
 
 # Subspace clustering settings
@@ -90,37 +108,21 @@ ZHIPU_CONFIG = {
 
 
 def get_zhipu_key():
-    """Retrieve Zhipu AI API key from environment or project config.yaml."""
-    key = os.environ.get("ZHIPU_API_KEY")
-    if key:
-        return key
-    try:
-        import yaml
-        config_path = PROJECT_ROOT / "config.yaml"
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
-            return cfg.get("ZHIPU_KEY", "")
-    except Exception:
-        pass
-    return ""
+    """Retrieve the Zhipu AI API key from the ``ZHIPU_API_KEY`` environment variable.
+
+    API keys are injected via the environment only; they must never be stored
+    in ``config.yaml`` or any other version-controlled file.
+    """
+    return os.environ.get("ZHIPU_API_KEY", "").strip()
 
 
 def get_openai_key():
-    """Retrieve OpenAI API key from environment or project config.yaml."""
-    key = os.environ.get("OPENAI_API_KEY")
-    if key:
-        return key
-    try:
-        import yaml
-        config_path = PROJECT_ROOT / "config.yaml"
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
-            return cfg.get("OPENAI_KEY", "")
-    except Exception:
-        pass
-    return ""
+    """Retrieve the OpenAI API key from the ``OPENAI_API_KEY`` environment variable.
+
+    API keys are injected via the environment only; they must never be stored
+    in ``config.yaml`` or any other version-controlled file.
+    """
+    return os.environ.get("OPENAI_API_KEY", "").strip()
 
 
 if __name__ == "__main__":

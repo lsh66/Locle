@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import ast
 from openail.utils import load_mapping
 import ipdb
+import os
 import os.path as osp
 import editdistance
 from collections import Counter
@@ -1032,7 +1033,7 @@ if __name__ == '__main__':
     print("LLM GNN")
     args = get_command_line_args()    
     params_dict = load_yaml(args.yaml_path)
-    key = params_dict['OPENAI_KEY']
+    key = os.environ.get('OPENAI_API_KEY', '')
     data_path = params_dict['DATA_PATH']
     # set_endpoints(key, endpoint)
     seeds = [i for i in range(args.main_seed_num)]

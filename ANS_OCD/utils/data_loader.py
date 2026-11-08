@@ -37,6 +37,10 @@ PT_DATASET_FILES = {
     "wikics": "wikics_fixed_sbert.pt",
     "dblp": "dblp_fixed_sbert.pt",
     "amazon": "amazon_fixed_attr.pt",
+    "ppi": "ppi_fixed_attr.pt",
+    "ppi_bp": "ppi_bp_fixed_struct.pt",
+    "blogcatalog": "blogcatalog_fixed_struct.pt",
+    "facebook": "facebook_fixed_attr.pt",
 }
 
 

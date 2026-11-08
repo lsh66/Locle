@@ -5,6 +5,7 @@ from helper.args import get_command_line_args
 from helper.utils import load_yaml
 import torch
 import ipdb
+import os
 import os.path as osp
 from helper.active import GLOBAL_RESULT_PATH
 
@@ -66,8 +67,7 @@ if __name__ == '__main__':
     args = get_command_line_args()    
     params_dict = load_yaml(args.yaml_path)
     # endpoint = params_dict.get('OPENAI_BASE', None)
-    # if params_dict.get('OPENAI_KEY'):
-    key = params_dict['OPENAI_KEY']
+    key = os.environ.get('OPENAI_API_KEY', '')
     data_path = params_dict['DATA_PATH']
     seeds = [0]
     for dataset in datasets:
